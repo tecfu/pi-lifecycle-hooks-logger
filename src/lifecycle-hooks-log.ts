@@ -49,19 +49,38 @@ function ensureDir(filePath: string): void {
 
 let writeErrorReported = false;
 
+function reportWriteError(outputPath: string, error: unknown): void {
+	if (writeErrorReported) return;
+	writeErrorReported = true;
+	process.stderr.write(
+		`[pi-lifecycle-hooks-logger] Failed to write ${outputPath}: ${String(error)}\n`,
+	);
+}
+
+function prepareLog(outputPath: string): void {
+	try {
+		ensureDir(outputPath);
+	} catch (error) {
+		reportWriteError(outputPath, error);
+	}
+}
+
+function resetLog(outputPath: string): void {
+	try {
+		ensureDir(outputPath);
+		writeFileSync(outputPath, "");
+	} catch (error) {
+		reportWriteError(outputPath, error);
+	}
+}
+
 function writeLog(outputPath: string, entry: Record<string, unknown>): void {
 	try {
 		ensureDir(outputPath);
 		appendFileSync(outputPath, `${JSON.stringify(entry)}\n`);
 	} catch (error) {
 		// Logging must never break the Pi lifecycle hook that triggered it.
-		// Report the first failure for diagnostics, then keep the extension fail-open.
-		if (!writeErrorReported) {
-			writeErrorReported = true;
-			process.stderr.write(
-				`[pi-lifecycle-hooks-logger] Failed to write ${outputPath}: ${String(error)}\n`,
-			);
-		}
+		reportWriteError(outputPath, error);
 	}
 }
 
@@ -76,14 +95,13 @@ export default function (pi: ExtensionAPI & ExtensionContext) {
 
 	// Do not truncate here: Pi can reload an extension without starting a new
 	// session, and extension reload must not destroy the existing audit trail.
-	ensureDir(effectiveOutput);
+	prepareLog(effectiveOutput);
 
 	let currentPromptText: string | undefined;
 	let promptId = 0;
 
 	pi.on("session_start", async (event) => {
-		ensureDir(effectiveOutput);
-		writeFileSync(effectiveOutput, "");
+		resetLog(effectiveOutput);
 		promptId = 0;
 		currentPromptText = undefined;
 
@@ -168,7 +186,7 @@ export default function (pi: ExtensionAPI & ExtensionContext) {
 					entry = buildMessageEntry(sessionId(), hook, promptId, currentPromptText, model(), msg);
 					break;
 				}
-				case "turn_start": {
+				case "turn_start":
 					entry = buildTurnEntry(
 						sessionId(),
 						"turn_start",
@@ -178,7 +196,6 @@ export default function (pi: ExtensionAPI & ExtensionContext) {
 						model(),
 					);
 					break;
-				}
 				case "turn_end": {
 					const msg = event.message as
 						| { role?: string; customType?: string; id?: string; content?: string }
