@@ -117,7 +117,7 @@ export default function (pi: ExtensionAPI & ExtensionContext) {
 		currentPromptText = event.text;
 	});
 
-	const sessionId = () => pi.sessionManager.getSessionId() ?? "unknown";
+	const sessionId = () => pi.sessionManager?.getSessionId() ?? "unknown";
 	const model = () => (pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined);
 
 	pi.on("before_agent_start", async (event) => {
