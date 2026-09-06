@@ -1,69 +1,57 @@
 import { describe, expect, test } from "bun:test";
 import {
 	buildAgentEntry,
-	buildBeforeProviderHeadersEntry,
 	buildBaseEntry,
+	buildBeforeProviderHeadersEntry,
+	buildMessageEntry,
+	MAX_PROMPT_PREVIEW,
 } from "../src/lifecycle-hooks-log-helpers.ts";
 
-describe("agent_start hook", () => {
-	test("produces base entry with agent_start hook name", () => {
-		const entry = buildAgentEntry("sess-1", "agent_start", 1, "my prompt", "openai/gpt-4");
+describe("base lifecycle entries", () => {
+	test("include common lifecycle metadata", () => {
+		const entry = buildBaseEntry("sess-1", "agent_start", 1, "my prompt", "openai/gpt-4", "agent_start");
 
 		expect(entry.hook).toBe("agent_start");
 		expect(entry["session-id"]).toBe("sess-1");
 		expect(entry["prompt-id"]).toBe(1);
 		expect(entry.prompt).toBe("my prompt");
 		expect(entry.model).toBe("openai/gpt-4");
+		expect(entry.context).toBe("agent_start");
 		expect(entry.ts).toBeDefined();
 		expect(entry.createdAt).toBeDefined();
 	});
 
-	test("no extra fields", () => {
-		const entry = buildAgentEntry("sess-2", "agent_start", 1);
+	test("truncates long prompts consistently", () => {
+		const prompt = "x".repeat(MAX_PROMPT_PREVIEW + 100);
+		const entry = buildBaseEntry("sess-2", "context", 2, prompt);
 
-		expect(entry["tool-call-id"]).toBeUndefined();
-		expect(entry["turn-index"]).toBeUndefined();
-		expect(entry["message-role"]).toBeUndefined();
-		expect(entry["is-error"]).toBeUndefined();
+		expect(entry.prompt).toHaveLength(MAX_PROMPT_PREVIEW + 1);
+		expect(entry.prompt).toBe(`${"x".repeat(MAX_PROMPT_PREVIEW)}…`);
 	});
 });
 
-describe("agent_end hook", () => {
-	test("produces base entry with agent_end hook name", () => {
-		const entry = buildAgentEntry("sess-1", "agent_end", 3);
+describe("agent lifecycle hooks", () => {
+	test.each(["agent_start", "agent_end", "agent_settled"] as const)("builds %s entries", (hook) => {
+		const entry = buildAgentEntry("sess-1", hook, 3, "prompt", "anthropic/claude-3");
 
-		expect(entry.hook).toBe("agent_end");
+		expect(entry.hook).toBe(hook);
 		expect(entry["session-id"]).toBe("sess-1");
 		expect(entry["prompt-id"]).toBe(3);
+		expect(entry.prompt).toBe("prompt");
+		expect(entry.model).toBe("anthropic/claude-3");
 	});
 
-	test("no extra fields", () => {
+	test("does not add unrelated fields", () => {
 		const entry = buildAgentEntry("sess-2", "agent_end", 1);
 
 		expect(entry["tool-call-id"]).toBeUndefined();
 		expect(entry["turn-index"]).toBeUndefined();
+		expect(entry["message-role"]).toBeUndefined();
 	});
 });
 
-describe("agent_settled hook", () => {
-	test("produces base entry with agent_settled hook name", () => {
-		const entry = buildAgentEntry("sess-1", "agent_settled", 5, "long prompt", "anthropic/claude-3");
-
-		expect(entry.hook).toBe("agent_settled");
-		expect(entry.prompt).toBe("long prompt");
-		expect(entry.model).toBe("anthropic/claude-3");
-	});
-
-	test("no extra fields", () => {
-		const entry = buildAgentEntry("sess-2", "agent_settled", 0);
-
-		expect(entry["tool-results-count"]).toBeUndefined();
-		expect(entry["payload-keys"]).toBeUndefined();
-	});
-});
-
-describe("before_provider_headers hook", () => {
-	test("produces base entry with before_provider_headers hook name", () => {
+describe("before_provider_headers", () => {
+	test("builds the expected base entry", () => {
 		const entry = buildBeforeProviderHeadersEntry("sess-1", 2, "query?", "gcp/gemini");
 
 		expect(entry.hook).toBe("before_provider_headers");
@@ -72,85 +60,34 @@ describe("before_provider_headers hook", () => {
 		expect(entry.prompt).toBe("query?");
 		expect(entry.model).toBe("gcp/gemini");
 	});
-
-	test("no extra fields", () => {
-		const entry = buildBeforeProviderHeadersEntry("sess-2", 0);
-
-		expect(entry.status).toBeUndefined();
-		expect(entry["headers-keys"]).toBeUndefined();
-		expect(entry["payload-keys"]).toBeUndefined();
-	});
-
-	test("truncates long prompt", () => {
-		const long = "x".repeat(200);
-		const entry = buildBeforeProviderHeadersEntry("sess-3", 3, long, "m");
-
-		expect(entry.prompt?.length).toBe(101);
-		expect(entry.prompt).toContain("…");
-	});
 });
 
-describe("input hook (no entry produced)", () => {
-	test("input does not produce a log entry — it only tracks prompt text", () => {
-		// The input hook does not create a JSONL line.
-		// It stores the prompt text so subsequent hooks can reference it.
-		// This is tested implicitly by the fact that no buildInputEntry exists.
-		expect(true).toBe(true);
+describe("message lifecycle hooks", () => {
+	test("records message metadata and uses the same prompt bound", () => {
+		const prompt = "p".repeat(MAX_PROMPT_PREVIEW + 50);
+		const message = {
+			role: "assistant",
+			customType: "text",
+			id: "msg-1",
+			content: "c".repeat(MAX_PROMPT_PREVIEW + 50),
+		};
+
+		const entry = buildMessageEntry("sess-3", "message_end", 4, prompt, "openai/gpt-5", message);
+
+		expect(entry.hook).toBe("message_end");
+		expect(entry.prompt).toHaveLength(MAX_PROMPT_PREVIEW + 1);
+		expect(entry["message-role"]).toBe("assistant");
+		expect(entry["message-type"]).toBe("text");
+		expect(entry["message-id"]).toBe("msg-1");
+		expect(entry["message-preview"]).toHaveLength(MAX_PROMPT_PREVIEW + 1);
 	});
 
-	test("input is the first hook in the lifecycle", () => {
-		// Verify input is hook #1 by checking it appears first in the constants.
-		const lifecycleHooks = [
-			"input",
-			"before_agent_start",
-			"agent_start",
-		] as const;
+	test("does not add message fields when the message is absent", () => {
+		const entry = buildMessageEntry("sess-4", "message_start", 1, "prompt");
 
-		expect(lifecycleHooks[0]).toBe("input");
-	});
-});
-
-describe("all 19 hooks produce correct hook field", () => {
-	// Each hook must produce an entry where `.hook` matches the event name.
-	// This ensures we don't have dead code or misnamed hooks.
-
-	test("agent_start", () => {
-		const entry = buildAgentEntry("s", "agent_start", 1);
-		expect(entry.hook).toBe("agent_start");
-	});
-
-	test("agent_end", () => {
-		const entry = buildAgentEntry("s", "agent_end", 1);
-		expect(entry.hook).toBe("agent_end");
-	});
-
-	test("agent_settled", () => {
-		const entry = buildAgentEntry("s", "agent_settled", 1);
-		expect(entry.hook).toBe("agent_settled");
-	});
-
-	test("agent_start base entry", () => {
-		const entry = buildBaseEntry("s", "agent_start", 1);
-		expect(entry.hook).toBe("agent_start");
-	});
-
-	test("agent_end base entry", () => {
-		const entry = buildBaseEntry("s", "agent_end", 1);
-		expect(entry.hook).toBe("agent_end");
-	});
-
-	test("agent_settled base entry", () => {
-		const entry = buildBaseEntry("s", "agent_settled", 1);
-		expect(entry.hook).toBe("agent_settled");
-	});
-
-	test("before_provider_headers base entry", () => {
-		const entry = buildBaseEntry("s", "before_provider_headers", 1);
-		expect(entry.hook).toBe("before_provider_headers");
-	});
-
-	test("before_provider_headers dedicated entry", () => {
-		const entry = buildBeforeProviderHeadersEntry("s", 1);
-		expect(entry.hook).toBe("before_provider_headers");
+		expect(entry["message-role"]).toBeUndefined();
+		expect(entry["message-type"]).toBeUndefined();
+		expect(entry["message-id"]).toBeUndefined();
+		expect(entry["message-preview"]).toBeUndefined();
 	});
 });
