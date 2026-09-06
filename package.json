@@ -11,16 +11,16 @@
     "hooks",
     "logging"
   ],
-  "homepage": "https://github.com/<username>/pi-lifecycle-hooks-logger#readme",
+  "homepage": "https://github.com/tecfu/pi-lifecycle-hooks-logger#readme",
   "bugs": {
-    "url": "https://github.com/<username>/pi-lifecycle-hooks-logger/issues"
+    "url": "https://github.com/tecfu/pi-lifecycle-hooks-logger/issues"
   },
   "license": "MIT",
-  "author": "<author>",
+  "author": "tecfu",
   "contributors": [],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/<username>/pi-lifecycle-hooks-logger.git"
+    "url": "git+https://github.com/tecfu/pi-lifecycle-hooks-logger.git"
   },
   "files": [
     "index.ts",

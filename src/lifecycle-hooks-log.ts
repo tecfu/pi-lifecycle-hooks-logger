@@ -10,13 +10,12 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
-import type {
-	ExtensionAPI,
-	ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import { dirname } from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	buildAfterProviderResponseEntry,
 	buildAgentEntry,
+	buildBaseEntry,
 	buildBeforeAgentStartEntry,
 	buildBeforeProviderHeadersEntry,
 	buildBeforeProviderRequestEntry,
@@ -32,29 +31,57 @@ const DEFAULT_OUTPUT = "/tmp/pi-lifecycle-hooks.jsonl";
 const ENV_VAR = "PI_LIFECYCLE_HOOKS_LOG";
 
 function resolveOutputPath(pi: ExtensionAPI): string {
-	// 1. CLI flag (--hooks-log-output)
 	const flagVal = pi.getFlag("hooks-log-output");
 	if (typeof flagVal === "string" && flagVal.length > 0) return flagVal;
 
-	// 2. Environment variable
 	const envVal = process.env[ENV_VAR];
 	if (typeof envVal === "string" && envVal.length > 0) return envVal;
 
-	// 3. Default
 	return DEFAULT_OUTPUT;
 }
 
-function ensureDir(path: string): void {
-	const dir = path.substring(0, path.lastIndexOf("/"));
-	if (dir && !existsSync(dir)) {
+function ensureDir(filePath: string): void {
+	const dir = dirname(filePath);
+	if (dir !== "." && !existsSync(dir)) {
 		mkdirSync(dir, { recursive: true });
 	}
 }
 
+let writeErrorReported = false;
+
+function reportWriteError(outputPath: string, error: unknown): void {
+	if (writeErrorReported) return;
+	writeErrorReported = true;
+	process.stderr.write(
+		`[pi-lifecycle-hooks-logger] Failed to write ${outputPath}: ${String(error)}\n`,
+	);
+}
+
+function prepareLog(outputPath: string): void {
+	try {
+		ensureDir(outputPath);
+	} catch (error) {
+		reportWriteError(outputPath, error);
+	}
+}
+
+function resetLog(outputPath: string): void {
+	try {
+		ensureDir(outputPath);
+		writeFileSync(outputPath, "");
+	} catch (error) {
+		reportWriteError(outputPath, error);
+	}
+}
+
 function writeLog(outputPath: string, entry: Record<string, unknown>): void {
-	ensureDir(outputPath);
-	const line = `${JSON.stringify(entry)}\n`;
-	appendFileSync(outputPath, line);
+	try {
+		ensureDir(outputPath);
+		appendFileSync(outputPath, `${JSON.stringify(entry)}\n`);
+	} catch (error) {
+		// Logging must never break the Pi lifecycle hook that triggered it.
+		reportWriteError(outputPath, error);
+	}
 }
 
 export default function (pi: ExtensionAPI & ExtensionContext) {
@@ -66,20 +93,15 @@ export default function (pi: ExtensionAPI & ExtensionContext) {
 
 	const effectiveOutput = resolveOutputPath(pi);
 
-	// Overwrite with empty file on load so each process starts clean.
-	ensureDir(effectiveOutput);
-	writeFileSync(effectiveOutput, "");
+	// Do not truncate here: Pi can reload an extension without starting a new
+	// session, and extension reload must not destroy the existing audit trail.
+	prepareLog(effectiveOutput);
 
-	// Tracks the current user prompt text so we can attach it to subsequent
-	// lifecycle events within the same turn.
 	let currentPromptText: string | undefined;
-	// Tracks prompt counter per session.
 	let promptId = 0;
 
-	// Clear the file on session start so we don't bleed across session switches.
 	pi.on("session_start", async (event) => {
-		ensureDir(effectiveOutput);
-		writeFileSync(effectiveOutput, "");
+		resetLog(effectiveOutput);
 		promptId = 0;
 		currentPromptText = undefined;
 
@@ -95,83 +117,45 @@ export default function (pi: ExtensionAPI & ExtensionContext) {
 		currentPromptText = event.text;
 	});
 
-	// before_agent_start: custom entry with prompt metadata.
+	const sessionId = () => pi.sessionManager.getSessionId() ?? "unknown";
+	const model = () => (pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined);
+
 	pi.on("before_agent_start", async (event) => {
-		writeLog(effectiveOutput, buildBeforeAgentStartEntry(
-			pi.sessionManager.getSessionId() ?? "unknown",
-			promptId,
-			event.prompt,
-			event.prompt.length,
-			!!event.images?.length,
-			pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined,
-		));
+		writeLog(
+			effectiveOutput,
+			buildBeforeAgentStartEntry(
+				sessionId(),
+				promptId,
+				event.prompt,
+				event.prompt.length,
+				!!event.images?.length,
+				model(),
+			),
+		);
 	});
 
-	// agent_start: base entry, no extra fields.
 	pi.on("agent_start", async () => {
-		writeLog(effectiveOutput, buildAgentEntry(
-			pi.sessionManager.getSessionId() ?? "unknown",
-			"agent_start",
-			promptId,
-			currentPromptText,
-			pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined,
-		));
+		writeLog(effectiveOutput, buildAgentEntry(sessionId(), "agent_start", promptId, currentPromptText, model()));
 	});
 
-	// agent_end: base entry, no extra fields.
 	pi.on("agent_end", async () => {
-		writeLog(effectiveOutput, buildAgentEntry(
-			pi.sessionManager.getSessionId() ?? "unknown",
-			"agent_end",
-			promptId,
-			currentPromptText,
-			pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined,
-		));
+		writeLog(effectiveOutput, buildAgentEntry(sessionId(), "agent_end", promptId, currentPromptText, model()));
 	});
 
-	// agent_settled: base entry, no extra fields.
-	// ponytail: TS can't narrow string into overloaded `pi.on()` signature.
-	// @ts-expect-error - hook is valid.
+	// @ts-expect-error - agent_settled is a valid Pi hook but is not present in older overload declarations.
 	pi.on("agent_settled", async () => {
-		writeLog(effectiveOutput, buildAgentEntry(
-			pi.sessionManager.getSessionId() ?? "unknown",
-			"agent_settled",
-			promptId,
-			currentPromptText,
-			pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined,
-		));
+		writeLog(effectiveOutput, buildAgentEntry(sessionId(), "agent_settled", promptId, currentPromptText, model()));
 	});
 
-	// before_provider_headers: base entry, no extra fields.
-	// ponytail: TS can't narrow string into overloaded `pi.on()` signature.
-	// @ts-expect-error - hook is valid.
+	// @ts-expect-error - before_provider_headers is a valid Pi hook but is not present in older overload declarations.
 	pi.on("before_provider_headers", async () => {
-		writeLog(effectiveOutput, buildBeforeProviderHeadersEntry(
-			pi.sessionManager.getSessionId() ?? "unknown",
-			promptId,
-			currentPromptText,
-			pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined,
-		));
+		writeLog(
+			effectiveOutput,
+			buildBeforeProviderHeadersEntry(sessionId(), promptId, currentPromptText, model()),
+		);
 	});
 
-	// Generic handlers for the remaining hooks.
-	// (input, before_agent_start, agent_start, agent_end, agent_settled,
-	//  before_provider_headers handled above)
-	const GENERIC_HOOKS: Array<
-		| "message_start"
-		| "message_update"
-		| "message_end"
-		| "turn_start"
-		| "turn_end"
-		| "context"
-		| "before_provider_request"
-		| "after_provider_response"
-		| "tool_execution_start"
-		| "tool_call"
-		| "tool_execution_update"
-		| "tool_result"
-		| "tool_execution_end"
-	> = [
+	const GENERIC_HOOKS = [
 		"message_start",
 		"message_update",
 		"message_end",
@@ -185,21 +169,12 @@ export default function (pi: ExtensionAPI & ExtensionContext) {
 		"tool_execution_update",
 		"tool_result",
 		"tool_execution_end",
-	];
+	] as const;
 
 	for (const hook of GENERIC_HOOKS) {
-		// ponytail: TS can't narrow loop variable into overloaded `pi.on()` signatures.
 		const handler = async (event: { [key: string]: unknown }) => {
-			const entry: Record<string, unknown> = {
-				ts: new Date().toISOString(),
-				createdAt: Date.now(),
-				"session-id": pi.sessionManager.getSessionId() ?? "unknown",
-				hook,
-				"prompt-id": promptId,
-				prompt: currentPromptText,
-				model: pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined,
-				context: hook,
-			};
+			const base = () => buildBaseEntry(sessionId(), hook, promptId, currentPromptText, model(), hook);
+			let entry = base();
 
 			switch (hook) {
 				case "message_start":
@@ -208,144 +183,123 @@ export default function (pi: ExtensionAPI & ExtensionContext) {
 					const msg = event.message as
 						| { role?: string; customType?: string; id?: string; content?: string }
 						| undefined;
-					entry["message-role"] = msg?.role;
-					entry["message-type"] = msg?.customType;
-					entry["message-id"] = msg?.id;
-					if (msg?.content && typeof msg.content === "string") {
-						entry["message-preview"] = msg.content.slice(0, 100) + (msg.content.length > 100 ? "…" : "");
-					}
+					entry = buildMessageEntry(sessionId(), hook, promptId, currentPromptText, model(), msg);
 					break;
 				}
-				case "turn_start": {
-					const turnEntry = buildTurnEntry(
-						pi.sessionManager.getSessionId() ?? "unknown",
+				case "turn_start":
+					entry = buildTurnEntry(
+						sessionId(),
 						"turn_start",
 						(event.turnIndex as number) ?? 0,
 						promptId,
 						currentPromptText,
-						pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined,
+						model(),
 					);
-					Object.assign(entry, turnEntry);
 					break;
-				}
 				case "turn_end": {
 					const msg = event.message as
 						| { role?: string; customType?: string; id?: string; content?: string }
 						| undefined;
-					const turnEntry = buildTurnEntry(
-						pi.sessionManager.getSessionId() ?? "unknown",
+					entry = buildTurnEntry(
+						sessionId(),
 						"turn_end",
 						(event.turnIndex as number) ?? 0,
 						promptId,
 						currentPromptText,
-						pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined,
+						model(),
 						msg,
 						event.toolResults as { role?: string }[] | undefined,
 					);
-					Object.assign(entry, turnEntry);
 					break;
 				}
-				case "context": {
-					const ctxEntry = buildContextEntry(
-						pi.sessionManager.getSessionId() ?? "unknown",
+				case "context":
+					entry = buildContextEntry(
+						sessionId(),
 						event.messages as { role?: string }[] | undefined,
 						promptId,
 						currentPromptText,
-						pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined,
+						model(),
 					);
-					Object.assign(entry, ctxEntry);
 					break;
-				}
-				case "before_provider_request": {
-					const reqEntry = buildBeforeProviderRequestEntry(
-						pi.sessionManager.getSessionId() ?? "unknown",
+				case "before_provider_request":
+					entry = buildBeforeProviderRequestEntry(
+						sessionId(),
 						event.payload as Record<string, unknown> | undefined,
 						promptId,
 						currentPromptText,
-						pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined,
+						model(),
 					);
-					Object.assign(entry, reqEntry);
 					break;
-				}
-				case "after_provider_response": {
-					const respEntry = buildAfterProviderResponseEntry(
-						pi.sessionManager.getSessionId() ?? "unknown",
+				case "after_provider_response":
+					entry = buildAfterProviderResponseEntry(
+						sessionId(),
 						event.status as number,
 						event.headers as Record<string, unknown> ?? {},
 						promptId,
 						currentPromptText,
-						pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined,
+						model(),
 					);
-					Object.assign(entry, respEntry);
 					break;
-				}
 				case "tool_execution_start":
-				case "tool_call": {
-					const toolEntry = buildToolEntry(
-						pi.sessionManager.getSessionId() ?? "unknown",
-						hook as "tool_execution_start" | "tool_call" | "tool_execution_end",
+				case "tool_call":
+					entry = buildToolEntry(
+						sessionId(),
+						hook,
 						event.toolCallId as string,
 						event.toolName as string,
 						undefined,
 						promptId,
 						currentPromptText,
-						pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined,
+						model(),
 						event.args as Record<string, unknown> | undefined,
 						event.input as Record<string, unknown> | undefined,
 					);
-					Object.assign(entry, toolEntry);
 					break;
-				}
 				case "tool_execution_update": {
 					const partialResult = typeof event.partialResult === "string"
 						? event.partialResult
 						: JSON.stringify(event.partialResult);
-					const updateEntry = buildToolUpdateEntry(
-						pi.sessionManager.getSessionId() ?? "unknown",
+					entry = buildToolUpdateEntry(
+						sessionId(),
 						event.toolCallId as string,
 						event.toolName as string,
 						partialResult,
 						promptId,
 						currentPromptText,
-						pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined,
+						model(),
 					);
-					Object.assign(entry, updateEntry);
 					break;
 				}
-				case "tool_result": {
-					const resultEntry = buildToolResultEntry(
-						pi.sessionManager.getSessionId() ?? "unknown",
+				case "tool_result":
+					entry = buildToolResultEntry(
+						sessionId(),
 						event.toolCallId as string,
 						event.toolName as string,
 						event.isError as boolean,
 						event.content as { type?: string }[] | undefined,
 						promptId,
 						currentPromptText,
-						pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined,
+						model(),
 					);
-					Object.assign(entry, resultEntry);
 					break;
-				}
-				case "tool_execution_end": {
-					const endEntry = buildToolEntry(
-						pi.sessionManager.getSessionId() ?? "unknown",
+				case "tool_execution_end":
+					entry = buildToolEntry(
+						sessionId(),
 						"tool_execution_end",
 						event.toolCallId as string,
 						event.toolName as string,
 						event.isError as boolean,
 						promptId,
 						currentPromptText,
-						pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined,
+						model(),
 					);
-					Object.assign(entry, endEntry);
 					break;
-				}
 			}
 
 			writeLog(effectiveOutput, entry);
 		};
-		// ponytail: `pi.on` is overloaded on string literal types; a union can't match any single overload.
-		// @ts-expect-error - hook is a known valid event name from the loop.
+
+		// @ts-expect-error - the loop is restricted to known Pi hook names, but the overloads are not union-friendly.
 		pi.on(hook, handler);
 	}
 }
