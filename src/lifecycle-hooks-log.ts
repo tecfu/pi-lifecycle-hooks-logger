@@ -9,7 +9,7 @@
  *   --hooks-log-output <path>   Custom log file path (default: /tmp/pi-lifecycle-hooks.jsonl)
  */
 
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -65,15 +65,6 @@ function prepareLog(outputPath: string): void {
 	}
 }
 
-function resetLog(outputPath: string): void {
-	try {
-		ensureDir(outputPath);
-		writeFileSync(outputPath, "");
-	} catch (error) {
-		reportWriteError(outputPath, error);
-	}
-}
-
 function writeLog(outputPath: string, entry: Record<string, unknown>): void {
 	try {
 		ensureDir(outputPath);
@@ -93,17 +84,23 @@ export default function (pi: ExtensionAPI & ExtensionContext) {
 
 	const effectiveOutput = resolveOutputPath(pi);
 
-	// Do not truncate here: Pi can reload an extension without starting a new
-	// session, and extension reload must not destroy the existing audit trail.
+	// Append-only, never truncated: the default path is shared by every running
+	// Pi process, and a truncate from one process eats the others' lines while
+	// they are mid-write. Sessions are told apart by "session-id" + "pid".
+	// ponytail: no rotation; if the file outgrows /tmp, cap it in logrotate, not here.
 	prepareLog(effectiveOutput);
 
 	let currentPromptText: string | undefined;
 	let promptId = 0;
 
-	pi.on("session_start", async (event) => {
-		resetLog(effectiveOutput);
+	pi.on("session_start", async (event, ctx) => {
 		promptId = 0;
 		currentPromptText = undefined;
+		writeLog(effectiveOutput, {
+			...buildBaseEntry(sessionOf(ctx), "session_start", promptId, undefined, modelOf(ctx), event.reason),
+			pid: process.pid,
+			previousSessionFile: event.previousSessionFile,
+		});
 
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
 			const prev = event.previousSessionFile ? ` from ${event.previousSessionFile}` : "";
@@ -117,41 +114,44 @@ export default function (pi: ExtensionAPI & ExtensionContext) {
 		currentPromptText = event.text;
 	});
 
-	const sessionId = () => pi.sessionManager?.getSessionId() ?? "unknown";
-	const model = () => (pi.model ? `${pi.model.provider}/${pi.model.id}` : undefined);
+	// sessionManager and model live on the handler's ctx, not on the ExtensionAPI
+	// the factory receives — reading them off `pi` logged "unknown" forever.
+	const sessionOf = (ctx?: ExtensionContext) => ctx?.sessionManager?.getSessionId() ?? "unknown";
+	const modelOf = (ctx?: ExtensionContext) =>
+		ctx?.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 
-	pi.on("before_agent_start", async (event) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		writeLog(
 			effectiveOutput,
 			buildBeforeAgentStartEntry(
-				sessionId(),
+				sessionOf(ctx),
 				promptId,
 				event.prompt,
 				event.prompt.length,
 				!!event.images?.length,
-				model(),
+				modelOf(ctx),
 			),
 		);
 	});
 
-	pi.on("agent_start", async () => {
-		writeLog(effectiveOutput, buildAgentEntry(sessionId(), "agent_start", promptId, currentPromptText, model()));
+	pi.on("agent_start", async (event, ctx) => {
+		writeLog(effectiveOutput, buildAgentEntry(sessionOf(ctx), "agent_start", promptId, currentPromptText, modelOf(ctx)));
 	});
 
-	pi.on("agent_end", async () => {
-		writeLog(effectiveOutput, buildAgentEntry(sessionId(), "agent_end", promptId, currentPromptText, model()));
+	pi.on("agent_end", async (event, ctx) => {
+		writeLog(effectiveOutput, buildAgentEntry(sessionOf(ctx), "agent_end", promptId, currentPromptText, modelOf(ctx)));
 	});
 
 	// @ts-expect-error - agent_settled is a valid Pi hook but is not present in older overload declarations.
-	pi.on("agent_settled", async () => {
-		writeLog(effectiveOutput, buildAgentEntry(sessionId(), "agent_settled", promptId, currentPromptText, model()));
+	pi.on("agent_settled", async (event, ctx) => {
+		writeLog(effectiveOutput, buildAgentEntry(sessionOf(ctx), "agent_settled", promptId, currentPromptText, modelOf(ctx)));
 	});
 
 	// @ts-expect-error - before_provider_headers is a valid Pi hook but is not present in older overload declarations.
-	pi.on("before_provider_headers", async () => {
+	pi.on("before_provider_headers", async (event, ctx) => {
 		writeLog(
 			effectiveOutput,
-			buildBeforeProviderHeadersEntry(sessionId(), promptId, currentPromptText, model()),
+			buildBeforeProviderHeadersEntry(sessionOf(ctx), promptId, currentPromptText, modelOf(ctx)),
 		);
 	});
 
@@ -172,7 +172,9 @@ export default function (pi: ExtensionAPI & ExtensionContext) {
 	] as const;
 
 	for (const hook of GENERIC_HOOKS) {
-		const handler = async (event: { [key: string]: unknown }) => {
+		const handler = async (event: { [key: string]: unknown }, ctx: ExtensionContext) => {
+			const sessionId = () => sessionOf(ctx);
+			const model = () => modelOf(ctx);
 			const base = () => buildBaseEntry(sessionId(), hook, promptId, currentPromptText, model(), hook);
 			let entry = base();
 

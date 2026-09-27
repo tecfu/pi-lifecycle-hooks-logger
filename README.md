@@ -125,12 +125,14 @@ Hook-specific fields are appended based on the hook type (see [Hook fields table
 
 On each `session_start` event, the extension:
 
-1. Truncates the log file to zero bytes
+1. Appends a `session_start` marker line (with `pid` and the reason)
 2. Resets the prompt counter to 0
 3. Clears the cached prompt text
 4. Shows a notification for new/resume/fork session transitions
 
-This ensures the log file always contains only data from the current session.
+The log is append-only and is never truncated: the default path is shared by every
+running Pi process, so a reset from one process would eat the others' lines. Tell
+sessions apart by `session-id` (or `pid` on the marker lines).
 
 ## Lifecycle hooks reference
 
@@ -271,7 +273,7 @@ index.ts                             # Re-exports default; discovered by Pi
 
 **`lifecycle-hooks-log-helpers.ts`** — No Pi dependencies. Each factory function takes primitives and returns a `HookLogEntry` record. All 49 unit tests cover this module.
 
-**`lifecycle-hooks-log.ts`** — Imports helpers, registers the CLI flag, resolves the output path, and wires up 19 Pi lifecycle listeners. Handles session lifecycle (clear log, reset counters).
+**`lifecycle-hooks-log.ts`** — Imports helpers, registers the CLI flag, resolves the output path, and wires up 19 Pi lifecycle listeners. Handles session lifecycle (marker line, reset counters). `session-id` and `model` are read from the handler `ctx`, not from the extension API object.
 
 **`index.ts`** — Single re-export so Pi discovers the extension via the `pi.extensions` field in `package.json`.
 
